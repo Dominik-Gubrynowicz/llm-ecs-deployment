@@ -1,0 +1,322 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: Template with cicd for llm deployment
+
+Parameters:
+  Project:
+    Description: project name
+    Type: String
+  BuildspecFilepath:
+    Description: specifies where buildspec is sotred in the repository - provide path with filename i.e cicd/buildspec.yml
+    Type: String
+    Default: ai-service/buildspec.yml
+
+Resources: 
+  ApplicationCodeRepository:
+    Type: AWS::CodeCommit::Repository
+    UpdateReplacePolicy: Retain
+    DeletionPolicy: Retain
+    Properties:
+      RepositoryDescription: Repository used to store source code of the application
+      RepositoryName: !Sub ${Project}-code-repository
+
+  ArtifactBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub ${Project}-pipeline-artifacts
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - BucketKeyEnabled: true
+            ServerSideEncryptionByDefault: 
+              SSEAlgorithm: AES256
+
+  LLMBuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub ${Project}-build-llm-worker
+      Description: Codebuild project role
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        Type: LINUX_CONTAINER
+        Image: aws/codebuild/standard:7.0
+        ComputeType: BUILD_GENERAL1_LARGE
+        PrivilegedMode: true
+        EnvironmentVariables:
+          - Name: REGION
+            Value: !Ref AWS::Region
+          - Name: ACCOUNT_ID
+            Value: !Ref AWS::AccountId
+          - Name: PROJECT
+            Value: !Ref Project
+          - Name: REPOSITORY_URL
+            Value:
+              Fn::ImportValue: !Sub ${Project}-ecr-image-repository-uri
+          - Name: REQUEST_QUEUE_URL
+            Value:
+              Fn::ImportValue: !Sub ${Project}-requests-sqs
+          - Name: RESPONSE_QUEUE_URL
+            Value:
+              Fn::ImportValue: !Sub ${Project}-response-sqs
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: !Ref BuildspecFilepath
+      LogsConfig:
+        CloudWatchLogs:
+          Status: ENABLED
+          GroupName: !Sub /aws/codebuild/${Project}-build-llm-worker
+      ServiceRole: !GetAtt CodeImageBuilderServiceRole.Arn
+
+  LLMBuildProjectLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/codebuild/${Project}-build-llm-worker
+      RetentionInDays: 7
+
+  CodeImageBuilderServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Path: /
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          Effect: Allow
+          Action: sts:AssumeRole
+          Principal:
+            Service:
+              - codebuild.amazonaws.com
+      Policies:
+        - PolicyName: AllowLogging
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action: 
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !GetAtt LLMBuildProjectLogGroup.Arn
+        - PolicyName: AllowEcrPush
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:BatchGetImage
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:PutImage
+                  - ecr:InitiateLayerUpload
+                  - ecr:UploadLayerPart
+                  - ecr:CompleteLayerUpload
+                Resource:
+                  Fn::ImportValue: !Sub ${Project}-ecr-image-repository-arn
+              - Effect: Allow
+                Action:
+                  - ecr:GetAuthorizationToken
+                Resource: '*'
+        - PolicyName: AllowArtifactBucket
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:*
+                Resource: 
+                  - !Join [ '', [ 'arn:aws:s3:::', !Ref ArtifactBucket, '/*' ] ]
+                  - !Join [ '', [ 'arn:aws:s3:::', !Ref ArtifactBucket ] ]
+
+  LLMDeploymentPipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      RoleArn: !GetAtt ApplicationPipelineServiceRole.Arn
+      ArtifactStore:
+        Location: !Ref ArtifactBucket
+        Type: S3
+      Stages:
+        - Name: Source
+          Actions:
+            - Name: SourceAction
+              ActionTypeId:
+                Category: Source
+                Owner: AWS
+                Provider: CodeCommit
+                Version: "1"
+              Configuration:
+                RepositoryName: !GetAtt ApplicationCodeRepository.Name
+                BranchName: main
+                PollForSourceChanges: false
+              OutputArtifacts:
+                - Name: SourceOutput
+              RunOrder: 1
+        - Name: Build
+          Actions:
+            - Name: BuildAction
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: "1"
+              Configuration:
+                ProjectName: !Ref LLMBuildProject
+              InputArtifacts:
+                - Name: SourceOutput
+              OutputArtifacts:
+                - Name: BuildOutput
+              RunOrder: 2
+        - Name: Deploy
+          Actions:
+            - Name: DeployAction
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Provider: ECS
+                Version: '1'
+              Configuration:
+                ClusterName: 
+                  Fn::ImportValue: !Sub ${Project}-ecs-name
+                ServiceName:
+                  Fn::ImportValue: !Sub ${Project}-worker-service
+                FileName: ai-service/imagedefinitions.json
+              InputArtifacts:
+                - Name: BuildOutput
+              RunOrder: 3
+
+  ApplicationPipelineServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Path: /
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - codepipeline.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: AllowCloudformation
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - cloudformation:*
+                Resource: "*"
+        - PolicyName: AllowDeploymentRolePass
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action: iam:PassRole
+                Resource: !GetAtt DeploymentRole.Arn
+        - PolicyName: AllowCodebuildRun
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - codebuild:StartBuild
+                  - codebuild:BatchGetBuilds
+                Resource: !GetAtt LLMBuildProject.Arn
+        - PolicyName: AllowEcs
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ecs:*
+                Resource:
+                  - '*'
+        - PolicyName: AllowPassEcsRole
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action: iam:PassRole
+                Resource:
+                  - Fn::ImportValue: !Sub ${Project}-worker-execution-role-arn
+                  - Fn::ImportValue: !Sub ${Project}-worker-role-arn
+        - PolicyName: AllowCodecommitSource
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - codecommit:GetBranch
+                  - codecommit:GitPull
+                  - codecommit:GetCommit 
+                  - codecommit:UploadArchive
+                  - codecommit:GetUploadArchiveStatus
+                Resource: !Join [ '', [ 'arn:aws:codecommit:', !Ref 'AWS::Region', ':', !Ref 'AWS::AccountId', ':', !GetAtt ApplicationCodeRepository.Name  ] ]
+        - PolicyName: AllowArtifactBucket
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:*
+                Resource: 
+                  - !Join [ '', [ 'arn:aws:s3:::', !Ref ArtifactBucket, '/*' ] ]
+                  - !Join [ '', [ 'arn:aws:s3:::', !Ref ArtifactBucket ] ]
+
+  DeploymentRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Path: /
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: cloudformation.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AdministratorAccess
+
+  TriggerPipelineEventRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - events.amazonaws.com
+            Action: sts:AssumeRole
+      Path: /
+      Policies:
+        - PolicyName: !Sub ${Project}-pipeline-execution
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action: codepipeline:StartPipelineExecution
+                Resource: !Join [ '', [ 'arn:aws:codepipeline:', !Ref 'AWS::Region', ':', !Ref 'AWS::AccountId', ':', !Ref LLMDeploymentPipeline ] ] 
+
+  TriggerPipelineEvent:
+    Type: AWS::Events::Rule
+    Properties:
+      EventPattern:
+        source:
+          - aws.ApplicationCodeRepository
+        detail-type:
+          - 'CodeCommit Repository State Change'
+        resources:
+          - !Join [ '', [ 'arn:aws:codecommit:', !Ref 'AWS::Region', ':', !Ref 'AWS::AccountId', ':', !GetAtt ApplicationCodeRepository.Name  ] ]
+        detail:
+          event:
+            - referenceCreated
+            - referenceUpdated
+          referenceType:
+            - branch
+          referenceName:
+            - main
+      Targets:
+        - Arn: !Join [ '', [ 'arn:aws:codepipeline:', !Ref 'AWS::Region', ':', !Ref 'AWS::AccountId', ':', !Ref LLMDeploymentPipeline ] ] 
+          RoleArn: !GetAtt TriggerPipelineEventRole.Arn
+          Id: !Sub ${Project}-codepipeline

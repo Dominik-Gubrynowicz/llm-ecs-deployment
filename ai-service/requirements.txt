@@ -1,0 +1,6 @@
+einops
+transformers
+torch >= 2.0.0
+accelerate
+xformers
+boto3

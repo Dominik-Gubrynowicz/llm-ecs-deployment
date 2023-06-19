@@ -1,0 +1,320 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: Template with ECS cluster
+
+Parameters:
+  Project:
+    Description: project name
+    Type: String
+  ECSAMI:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ecs/optimized-ami/amazon-linux-2/gpu/recommended/image_id
+    Description: The Amazon Machine Image ID used for the cluster, leave it as the default value to get the latest AMI
+  InstanceType:
+    Type: String
+    Default: g5.xlarge
+  DesiredCapacity:
+    Type: String
+    Default: '0'
+    Description: Desired capacity of the ASG  
+  MaxCapacity:
+    Type: String
+    Default: '2'
+    Description: Max capacity of the ASG
+
+Resources:
+  ApplicationImageRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      ImageTagMutability: IMMUTABLE
+      RepositoryName: !Sub ${Project}-ecr-image-repository
+
+  ECSWorkerInstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Path: /
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonEC2ContainerServiceforEC2Role
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+
+  ECSTaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Path: /
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+  
+  ECSTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Path: /
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: AllowSQS
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action: 
+                  - sqs:*
+                Resource:
+                  - !GetAtt RequestQueue.Arn
+                  - !GetAtt ResponseQueue.Arn
+        - PolicyName: AllowLogging
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action: 
+                  - logs:*
+                Resource:
+                  - !GetAtt ECSLogGroup.Arn
+
+  ECSLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /ecs/${Project}
+      RetentionInDays: 7
+
+  ECSTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub ${Project}-worker
+      NetworkMode: host
+      RequiresCompatibilities:
+        - EC2
+      ExecutionRoleArn: !GetAtt ECSTaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt ECSTaskRole.Arn
+      RuntimePlatform:
+        CpuArchitecture: X86_64
+        OperatingSystemFamily: LINUX
+      Memory: "10240"
+      Cpu: "2048"
+      ContainerDefinitions:
+        - Name: llm
+          Image: !Sub ${ApplicationImageRepository.RepositoryUri}:latest
+          ResourceRequirements:
+            - Type: GPU
+              Value: "1"
+          Environment:
+            - Name: REQUEST_QUEUE_URL
+              Value: !GetAtt RequestQueue.QueueUrl
+            - Name: RESPONSE_QUEUE_URL
+              Value: !GetAtt ResponseQueue.QueueUrl
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Sub /ecs/${Project}
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: !Sub ${Project}
+
+  ECSService:
+    Type: AWS::ECS::Service
+    Properties:
+      Cluster: !Ref ECSCluster
+      ServiceName: !Sub ${Project}-worker-service
+      TaskDefinition: !Ref ECSTaskDefinition
+      DesiredCount: 0
+      DeploymentConfiguration:
+        MinimumHealthyPercent: 100
+        MaximumPercent: 200
+      CapacityProviderStrategy:
+        - CapacityProvider: !Ref WorkerCapacityProvider
+          Weight: 1
+
+  ECSWorkerInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Path: /
+      Roles:
+        - !Ref ECSWorkerInstanceRole
+
+  ECSWorkerAutoScaling:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      AutoScalingGroupName: !Sub ${Project}-asg-ecs-worker-instances
+      LaunchTemplate:
+        LaunchTemplateId: !Ref ECSWorkerLaunchTemplate
+        Version: !GetAtt ECSWorkerLaunchTemplate.LatestVersionNumber
+      MaxSize: !Ref MaxCapacity
+      MinSize: "0"
+      DesiredCapacity: !Ref DesiredCapacity
+      VPCZoneIdentifier:
+        - Fn::ImportValue: !Sub ${Project}-private-subnet-a
+        - Fn::ImportValue: !Sub ${Project}-private-subnet-b
+      Tags:
+        - Key: Name
+          PropagateAtLaunch: true
+          Value: !Sub ${Project}-asg-ecs-worker-instance
+
+    UpdatePolicy:
+      AutoScalingReplacingUpdate:
+        WillReplace: true
+
+  #Worker Security Group
+  WorkerSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub ${Project}-worker-sg
+      GroupDescription: SG for worker instances
+      VpcId: 
+        Fn::ImportValue: !Sub ${Project}-vpc-id
+      Tags:
+        - Key: Name
+          Value: !Sub ${Project}-worker-sg
+  WorkerSGIngressRule:
+    Type: AWS::EC2::SecurityGroupIngress
+    DependsOn: WorkerSG
+    Properties:
+      GroupId: !Ref WorkerSG
+      IpProtocol: "-1"
+      FromPort: -1
+      ToPort: -1
+      SourceSecurityGroupId: !Ref WorkerSG
+
+  ECSWorkerLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateData: 
+        IamInstanceProfile: 
+          Name: !Ref ECSWorkerInstanceProfile
+        ImageId: !Ref ECSAMI
+        InstanceType: !Ref InstanceType
+        SecurityGroupIds:
+          - !Ref WorkerSG
+        BlockDeviceMappings:
+          - DeviceName: /dev/xvda
+            Ebs:
+              VolumeType: gp2
+              VolumeSize: 50
+              DeleteOnTermination: true
+              Encrypted: true
+        UserData:
+          Fn::Base64:
+            !Sub
+            - |
+              #!/bin/bash -ex
+              echo ECS_CLUSTER=${ECSCluster} >> /etc/ecs/ecs.config
+              echo ECS_ENABLE_GPU_SUPPORT=true >> /etc/ecs/ecs.config
+              echo ECS_ENGINE_TASK_CLEANUP_WAIT_DURATION=1m >> /etc/ecs/ecs.config
+              echo ECS_IMAGE_CLEANUP_INTERVAL=1m >> /etc/ecs/ecs.config
+              echo ECS_IMAGE_MINIMUM_CLEANUP_AGE=1m >> /etc/ecs/ecs.config
+              echo "ip_resolve=4" >> /etc/yum.conf
+              yum install -y amazon-ssm-agent
+              systemctl enable amazon-ssm-agent
+              systemctl start amazon-ssm-agent
+            - ECSCluster: !Sub ${Project}-ecs-main
+              StackName: !Ref AWS::StackName
+              Region: !Ref AWS::Region
+
+  ECSCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub ${Project}-ecs-main
+      ClusterSettings:
+        - Name: containerInsights
+          Value: enabled
+
+  CapacityProviderAssociation:
+    Type: AWS::ECS::ClusterCapacityProviderAssociations
+    Properties:
+      Cluster: !Ref ECSCluster
+      CapacityProviders:
+        - !Ref WorkerCapacityProvider
+      DefaultCapacityProviderStrategy:
+        - CapacityProvider: !Ref WorkerCapacityProvider
+          Weight: 1
+
+  WorkerCapacityProvider:
+      Type: AWS::ECS::CapacityProvider
+      Properties:
+          AutoScalingGroupProvider:
+              AutoScalingGroupArn: !Ref ECSWorkerAutoScaling
+              ManagedScaling:
+                  MaximumScalingStepSize: 1
+                  MinimumScalingStepSize: 1
+                  Status: ENABLED
+                  TargetCapacity: 100
+
+  RequestQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub ${Project}-requests-queue
+      DelaySeconds: 0
+      MaximumMessageSize: 262144
+      MessageRetentionPeriod: 345600
+      VisibilityTimeout: 60
+      ReceiveMessageWaitTimeSeconds: 0
+  
+  ResponseQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub ${Project}-response-queue
+      DelaySeconds: 0
+      MaximumMessageSize: 262144
+      MessageRetentionPeriod: 345600
+      VisibilityTimeout: 30
+      ReceiveMessageWaitTimeSeconds: 0
+
+Outputs:
+  ASGIdentifier:
+    Description: Identifier of ASG group
+    Value: !Ref ECSWorkerAutoScaling
+    Export:
+      Name: !Sub ${Project}-worker-asg-id
+  ECSCluster:
+    Description: Name of the ECS cluster
+    Value: !Ref ECSCluster
+    Export:
+      Name: !Sub ${Project}-ecs-name
+  ECSWorkerService:
+    Description: Name of ECS service used by workers
+    Value: !Ref ECSService
+    Export:
+      Name: !Sub ${Project}-worker-service
+  RequestQueueUrl:
+    Description: URL of requests sqs queue
+    Value: !GetAtt RequestQueue.QueueUrl
+    Export:
+      Name: !Sub ${Project}-requests-sqs
+  ResponseQueueUrl:
+    Description: URL of response sqs queue
+    Value: !GetAtt ResponseQueue.QueueUrl
+    Export:
+      Name: !Sub ${Project}-response-sqs
+  ApplicationRepositoryUri:
+    Description: URI of worker repository
+    Value: !GetAtt ApplicationImageRepository.RepositoryUri
+    Export:
+      Name: !Sub ${Project}-ecr-image-repository-uri
+  ApplicationRepositoryArn:
+    Description: ARN of worker repository
+    Value: !GetAtt ApplicationImageRepository.Arn
+    Export:
+      Name: !Sub ${Project}-ecr-image-repository-arn
+  EcsWorkerTaskExecutionRoleArn:
+    Description: ARN of worker task execution IAM role
+    Value: !GetAtt ECSTaskExecutionRole.Arn
+    Export:
+      Name: !Sub ${Project}-worker-execution-role-arn
+  EcsWorkerTaskRoleArn:
+    Description: ARN of worker task IAM role
+    Value: !GetAtt ECSTaskRole.Arn
+    Export:
+      Name: !Sub ${Project}-worker-role-arn
