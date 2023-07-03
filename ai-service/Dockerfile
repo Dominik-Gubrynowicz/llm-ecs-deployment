@@ -1,4 +1,4 @@
-FROM nvidia/cuda:12.1.1-cudnn8-runtime-ubuntu22.04
+FROM public.ecr.aws/genophore/nvidia/cuda:11.8.0-cudnn8-runtime-ubuntu22.04
 
 RUN apt update -y && \
     apt install python3 python3-pip -y
